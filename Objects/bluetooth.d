@@ -28,6 +28,8 @@
 .\objects\bluetooth.o: .\Library\stm32f10x_usart.h
 .\objects\bluetooth.o: .\Library\stm32f10x_wwdg.h
 .\objects\bluetooth.o: .\Library\misc.h
+.\objects\bluetooth.o: HardWare\BlueTooth.h
 .\objects\bluetooth.o: HardWare\PWM.h
 .\objects\bluetooth.o: HardWare\PetAction.h
 .\objects\bluetooth.o: HardWare\Face_Config.h
+.\objects\bluetooth.o: C:\Program Files\Keil C51\ARM\ARMCC\Bin\..\include\string.h
