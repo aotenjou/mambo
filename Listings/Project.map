@@ -95,9 +95,9 @@ Section Cross References
     main.o(i.TIM3_IRQHandler) refers to main.o(.data) for PanDuan
     main.o(i.main) refers to servo.o(i.Servo_Init) for Servo_Init
     main.o(i.main) refers to oled.o(i.OLED_Init) for OLED_Init
-    main.o(i.main) refers to bluetooth.o(i.BlueTooth_Init) for BlueTooth_Init
     main.o(i.main) refers to oled.o(i.OLED_ShowImage) for OLED_ShowImage
     main.o(i.main) refers to oled.o(i.OLED_Update) for OLED_Update
+    main.o(i.main) refers to bluetooth.o(i.BlueTooth_Init) for BlueTooth_Init
     main.o(i.main) refers to bluetooth.o(i.BlueTooth_Poll) for BlueTooth_Poll
     main.o(i.main) refers to petaction.o(i.Action_relaxed_getdowm) for Action_relaxed_getdowm
     main.o(i.main) refers to servo.o(i.WServo_Angle) for WServo_Angle

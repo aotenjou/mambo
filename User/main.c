@@ -28,9 +28,9 @@ int main(void)
 
     Servo_Init();
     OLED_Init(); // OLED???
-    BlueTooth_Init(); // ?????
     OLED_ShowImage(0, 0, 128, 64, Face_sleep);
     OLED_Update();
+    BlueTooth_Init(); // ?????
     while (1)
     {
         BlueTooth_Poll();
