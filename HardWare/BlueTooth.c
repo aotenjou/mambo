@@ -1,9 +1,11 @@
 #include "stm32f10x.h"                  // Device header
 #include "BlueTooth.h"
+#include "Delay.h"
 #include "PWM.h"
 #include "PetAction.h"
 #include "Face_Config.h"
 #include <string.h>
+#include <ctype.h>
 
 volatile uint16_t AllLed = 1;
 volatile uint16_t BreatheLed = 0;
@@ -21,6 +23,10 @@ char BlueTooth_Name[32] = {0};
 static uint16_t bluetoothIgnoreTicks = 0;
 static char bluetoothAtBuffer[64];
 static uint8_t bluetoothAtLength = 0;
+static uint8_t bluetoothCommandEnabled = 0;
+static volatile uint16_t bluetoothStartupDelayMs = 1000;
+static uint8_t bluetoothATTried = 0;
+static uint32_t bluetoothNameSeed = 0x13579BDF;
 
 static uint8_t IsValidCommand(uint8_t cmd)
 {
@@ -38,13 +44,6 @@ static void FlushUsartErrors(USART_TypeDef *USARTx)
         volatile uint16_t data = USARTx->DR;
         (void)status;
         (void)data;
-    }
-}
-
-static void DelayCycles(volatile uint32_t cycles)
-{
-    while (cycles--)
-    {
     }
 }
 
@@ -80,39 +79,46 @@ static void BlueTooth_DrainRx(void)
     }
 }
 
-static uint8_t BlueTooth_CollectResponse(uint32_t timeoutCycles)
+static void BlueTooth_ReadPendingBytes(void)
 {
-    while (timeoutCycles--)
+    FlushUsartErrors(USART3);
+    while (USART_GetFlagStatus(USART3, USART_FLAG_RXNE) == SET)
     {
-        FlushUsartErrors(USART3);
-        if (USART_GetFlagStatus(USART3, USART_FLAG_RXNE) == SET)
+        char ch = (char)(USART_ReceiveData(USART3) & 0xFF);
+        if (bluetoothAtLength < (sizeof(bluetoothAtBuffer) - 1U))
         {
-            char ch = (char)(USART_ReceiveData(USART3) & 0xFF);
-            if (bluetoothAtLength < (sizeof(bluetoothAtBuffer) - 1U))
-            {
-                bluetoothAtBuffer[bluetoothAtLength++] = ch;
-                bluetoothAtBuffer[bluetoothAtLength] = '\0';
-            }
-            if (strstr(bluetoothAtBuffer, "OK\r\n") != 0)
-            {
-                return 1;
-            }
+            bluetoothAtBuffer[bluetoothAtLength++] = ch;
+            bluetoothAtBuffer[bluetoothAtLength] = '\0';
         }
-        else
+    }
+}
+
+static uint8_t BlueTooth_ResponseContains(const char *text)
+{
+    return (strstr(bluetoothAtBuffer, text) != 0);
+}
+
+static uint8_t BlueTooth_CollectResponse(uint16_t timeoutMs)
+{
+    while (timeoutMs--)
+    {
+        BlueTooth_ReadPendingBytes();
+        if (BlueTooth_ResponseContains("OK\r\n"))
         {
-            DelayCycles(120);
+            return 1;
         }
+        Delay_ms(1);
     }
     return 0;
 }
 
-static uint8_t BlueTooth_SendATCommand(const char *command, uint32_t timeoutCycles)
+static uint8_t BlueTooth_SendATCommand(const char *command, uint16_t timeoutMs)
 {
     BlueTooth_ResetAtBuffer();
     BlueTooth_DrainRx();
     BlueTooth_SendString(command);
     BlueTooth_SendString("\r\n");
-    return BlueTooth_CollectResponse(timeoutCycles);
+    return BlueTooth_CollectResponse(timeoutMs);
 }
 
 static uint8_t BlueTooth_ReadName(char *nameBuffer, uint8_t nameBufferSize)
@@ -120,11 +126,6 @@ static uint8_t BlueTooth_ReadName(char *nameBuffer, uint8_t nameBufferSize)
     char *start;
     char *end;
     uint8_t length;
-
-    if (!BlueTooth_SendATCommand("AT+NAME?", 600000U))
-    {
-        return 0;
-    }
 
     start = strstr(bluetoothAtBuffer, "+NAME:");
     if (start == 0)
@@ -150,38 +151,114 @@ static uint8_t BlueTooth_ReadName(char *nameBuffer, uint8_t nameBufferSize)
     return 1;
 }
 
+static uint32_t BlueTooth_NextRandom(void)
+{
+    bluetoothNameSeed = bluetoothNameSeed * 1103515245UL + 12345UL;
+    return bluetoothNameSeed;
+}
+
+static uint8_t BlueTooth_IsLowerAlphaNum(char ch)
+{
+    return ((ch >= 'a') && (ch <= 'z')) || ((ch >= '0') && (ch <= '9'));
+}
+
+static uint8_t BlueTooth_NameMatchesRule(const char *name)
+{
+    uint8_t i;
+    uint8_t prefixLen = (uint8_t)strlen(BLUETOOTH_NAME_PREFIX);
+
+    if (strlen(name) != (size_t)(prefixLen + BLUETOOTH_NAME_SUFFIX_LEN))
+    {
+        return 0;
+    }
+
+    if (strncmp(name, BLUETOOTH_NAME_PREFIX, prefixLen) != 0)
+    {
+        return 0;
+    }
+
+    for (i = 0; i < BLUETOOTH_NAME_SUFFIX_LEN; i++)
+    {
+        if (!BlueTooth_IsLowerAlphaNum(name[prefixLen + i]))
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static void BlueTooth_GenerateTargetName(char *nameBuffer, uint8_t nameBufferSize)
+{
+    static const char charset[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    uint8_t prefixLen = (uint8_t)strlen(BLUETOOTH_NAME_PREFIX);
+    uint8_t i;
+
+    if (nameBufferSize <= (uint8_t)(prefixLen + BLUETOOTH_NAME_SUFFIX_LEN))
+    {
+        if (nameBufferSize > 0)
+        {
+            nameBuffer[0] = '\0';
+        }
+        return;
+    }
+
+    strcpy(nameBuffer, BLUETOOTH_NAME_PREFIX);
+    for (i = 0; i < BLUETOOTH_NAME_SUFFIX_LEN; i++)
+    {
+        nameBuffer[prefixLen + i] = charset[BlueTooth_NextRandom() % (sizeof(charset) - 1U)];
+    }
+    nameBuffer[prefixLen + BLUETOOTH_NAME_SUFFIX_LEN] = '\0';
+}
+
 static void BlueTooth_ConfigName(void)
 {
+    char targetName[32];
     char commandBuffer[48];
 
     BlueTooth_ATReady = 0;
     BlueTooth_NameReady = 0;
     BlueTooth_Name[0] = '\0';
+    bluetoothCommandEnabled = 0;
+    USART_ITConfig(USART3, USART_IT_RXNE, DISABLE);
+    BlueTooth_DrainRx();
 
-    if (!BlueTooth_SendATCommand("AT", 300000U))
+    if (!BlueTooth_SendATCommand("AT", 5000))
     {
-        return;
+        goto config_exit;
     }
     BlueTooth_ATReady = 1;
 
+    if (!BlueTooth_SendATCommand("AT+NAME?", 5000))
+    {
+        goto config_exit;
+    }
+
     if (!BlueTooth_ReadName(BlueTooth_Name, sizeof(BlueTooth_Name)))
     {
-        return;
+        goto config_exit;
     }
 
     BlueTooth_NameReady = 1;
-    if (strcmp(BlueTooth_Name, BLUETOOTH_TARGET_NAME) == 0)
+    if (BlueTooth_NameMatchesRule(BlueTooth_Name))
     {
-        return;
+        goto config_exit;
     }
 
+    BlueTooth_GenerateTargetName(targetName, sizeof(targetName));
     strcpy(commandBuffer, "AT+NAME=");
-    strcat(commandBuffer, BLUETOOTH_TARGET_NAME);
-    if (BlueTooth_SendATCommand(commandBuffer, 600000U))
+    strcat(commandBuffer, targetName);
+    if (BlueTooth_SendATCommand(commandBuffer, 5000))
     {
-        strcpy(BlueTooth_Name, BLUETOOTH_TARGET_NAME);
+        strcpy(BlueTooth_Name, targetName);
         BlueTooth_NameReady = 1;
     }
+
+config_exit:
+    BlueTooth_DrainRx();
+    bluetoothCommandEnabled = 1;
+    USART_ClearITPendingBit(USART3, USART_IT_RXNE);
+    USART_ITConfig(USART3, USART_IT_RXNE, ENABLE);
 }
 
 static void HandleCommand(uint8_t cmd)
@@ -407,53 +484,38 @@ void BlueTooth_Init(void)
     NVIC_Init(&NVIC_InitStructure);
 
     NVIC_InitStructure.NVIC_IRQChannel = USART3_IRQn;
-    NVIC_InitStructure.NVIC_IRQChannelCmd = DISABLE;
+    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
     NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 2;
     NVIC_InitStructure.NVIC_IRQChannelSubPriority = 1;
     NVIC_Init(&NVIC_InitStructure);
 
     USART_Cmd(USART1, ENABLE);
     USART_Cmd(USART3, ENABLE);
-    BlueTooth_ConfigName();
+    bluetoothCommandEnabled = 1;
+    bluetoothStartupDelayMs = 1000;
+    bluetoothATTried = 0;
 }
 
 void BlueTooth_Poll(void)
 {
-    static uint8_t lastState = 0;
-    uint8_t pinState = GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_5);
     FlushUsartErrors(USART3);
-
-    if (pinState != lastState)
-    {
-        lastState = pinState;
-        if (pinState == Bit_SET)
-        {
-            bluetoothIgnoreTicks = 3000;
-        }
-    }
-
     if (bluetoothIgnoreTicks > 0)
     {
         bluetoothIgnoreTicks--;
     }
 
-    if (pinState == Bit_SET)
+    if ((bluetoothATTried == 0) && (bluetoothStartupDelayMs == 0))
     {
-        GPIO_ResetBits(GPIOA, GPIO_Pin_4);
+        bluetoothATTried = 1;
+        BlueTooth_ConfigName();
     }
-    else
-    {
-        GPIO_SetBits(GPIOA, GPIO_Pin_4);
-    }
+}
 
-    while (USART_GetFlagStatus(USART3, USART_FLAG_RXNE) == SET)
+void BlueTooth_TimerTick(void)
+{
+    if (bluetoothStartupDelayMs > 0)
     {
-        uint8_t cmd = (uint8_t)(USART_ReceiveData(USART3) & 0xFF);
-        if ((bluetoothIgnoreTicks == 0) && IsValidCommand(cmd))
-        {
-            Sustainedmove = 0;
-            HandleCommand(cmd);
-        }
+        bluetoothStartupDelayMs--;
     }
 }
 
@@ -475,4 +537,14 @@ void USART1_IRQHandler(void)
 void USART3_IRQHandler(void)
 {
     FlushUsartErrors(USART3);
+    if (USART_GetITStatus(USART3, USART_IT_RXNE) == SET)
+    {
+        uint8_t cmd = (uint8_t)(USART_ReceiveData(USART3) & 0xFF);
+        if (bluetoothCommandEnabled && (bluetoothIgnoreTicks == 0) && IsValidCommand(cmd))
+        {
+            Sustainedmove = 0;
+            HandleCommand(cmd);
+        }
+        USART_ClearITPendingBit(USART3, USART_IT_RXNE);
+    }
 }

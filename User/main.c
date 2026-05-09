@@ -25,6 +25,7 @@ uint16_t Wait = 0;
 
 int main(void)
 {
+    uint8_t chargeState;
 
     Servo_Init();
     OLED_Init(); // OLED???
@@ -33,6 +34,16 @@ int main(void)
     BlueTooth_Init(); // ?????
     while (1)
     {
+        chargeState = GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_5);
+        if (chargeState == Bit_SET)
+        {
+            GPIO_ResetBits(GPIOA, GPIO_Pin_4);
+        }
+        else
+        {
+            GPIO_SetBits(GPIOA, GPIO_Pin_4);
+        }
+
         BlueTooth_Poll();
 
         if(Action_Mode==0){Action_relaxed_getdowm();WServo_Angle(90);} // ????
@@ -59,6 +70,8 @@ void TIM3_IRQHandler(void)
 {
     if (TIM_GetITStatus(TIM3, TIM_IT_Update) == SET)
     {
+        BlueTooth_TimerTick();
+
         if (AllLed == 1 && BreatheLed == 0)
         {
             PWM_LED1(20000);

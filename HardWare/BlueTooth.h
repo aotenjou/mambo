@@ -3,7 +3,8 @@
 
 #include <stdint.h>
 
-#define BLUETOOTH_TARGET_NAME "guaguale_manbo"
+#define BLUETOOTH_NAME_PREFIX "guaguale_manbo_"
+#define BLUETOOTH_NAME_SUFFIX_LEN 5
 
 extern volatile uint16_t Action_Mode;
 extern volatile uint16_t Face_Mode;
@@ -19,5 +20,6 @@ extern char BlueTooth_Name[32];
 
 void BlueTooth_Init(void);
 void BlueTooth_Poll(void);
+void BlueTooth_TimerTick(void);
 
 #endif
