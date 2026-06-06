@@ -1,27 +1,31 @@
 /**
- * Bluetooth Console for Desktop Pet Control (Enhanced with BLE GATT support)
- * Connects to HC-05/HC-06 (Classic SPP) or ECB01H2S (BLE NUS) Bluetooth modules
+ * Bluetooth Console for Desktop Pet Control (BLE GATT)
+ * Connects to ECB01H2S (and compatible) BLE modules via custom GATT service
  *
  * Supports:
- *   - Classic Bluetooth RFCOMM/SPP connection
- *   - BLE GATT connection via Nordic UART Service (NUS)
+ *   - BLE GATT connection via Nordic UART Service (NUS) or ECB01H2S custom UUIDs
+ *   - Auto-detection of RX/TX characteristics by UUID or properties
  *
+ * Define DISABLE_CLASSIC_BT to remove Classic Bluetooth SPP support (default: defined).
  * Build: use compile_ble.bat
  */
 
 #define _CRT_SECURE_NO_WARNINGS
+#define DISABLE_CLASSIC_BT
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 
+#include <windows.h>
+#ifndef DISABLE_CLASSIC_BT
 #include <winsock2.h>
 #include <ws2bth.h>
-#include <windows.h>
 #include <bluetoothapis.h>
 #pragma warning(disable: 4995)
 #include <objbase.h>
 #include <initguid.h>
+#endif
 
 // WinRT headers
 #include <winrt/Windows.Foundation.h>
@@ -44,10 +48,13 @@
 #include <cstdio>
 #include <condition_variable>
 
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "runtimeobject.lib")
+#ifndef DISABLE_CLASSIC_BT
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "bthprops.lib")
-#pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "runtimeobject.lib")
+#endif
 
 using namespace winrt;
 using namespace Windows::Devices::Enumeration;
@@ -57,7 +64,9 @@ using namespace Windows::Devices::Bluetooth::GenericAttributeProfile;
 using namespace Windows::Storage::Streams;
 
 // Serial Port Profile UUID (Classic BT)
+#ifndef DISABLE_CLASSIC_BT
 DEFINE_GUID(GUID_SERIAL_PORT_SERVICE, 0x00001101, 0x0000, 0x1000, 0x80, 0x00, 0x00, 0x80, 0x5F, 0x9B, 0x34, 0xFB);
+#endif
 
 // Nordic UART Service (NUS) UUIDs
 static const winrt::guid NUS_SERVICE_UUID  = {0x6E400001, 0xB5A3, 0xF393, {0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E}};
@@ -70,9 +79,11 @@ static const winrt::guid ECB_RX_CHAR_UUID  = {0x0000FFF2, 0x0000, 0x1000, {0x80,
 static const winrt::guid ECB_TX_CHAR_UUID  = {0x0000FFF1, 0x0000, 0x1000, {0x80, 0x00, 0x00, 0x80, 0x5F, 0x9B, 0x34, 0xFB}};  // Notify
 
 // Device name prefixes
+#ifndef DISABLE_CLASSIC_BT
 const wchar_t* DEVICE_PREFIX = L"HC-05";
 const wchar_t* DEVICE_PREFIX_ALT = L"HC-06";
 const wchar_t* DEVICE_PREFIX_PET = L"Pet";
+#endif
 const wchar_t* DEVICE_PREFIX_BLE  = L"guaguale";   // ECB01H2S module name prefix
 
 // Global state
@@ -80,11 +91,17 @@ std::atomic<bool> g_running(true);
 std::atomic<bool> g_connected(false);
 
 // Connection mode
-enum class ConnectionMode { None, ClassicSPP, BLEGATT };
+enum class ConnectionMode { None
+#ifndef DISABLE_CLASSIC_BT
+    , ClassicSPP
+#endif
+    , BLEGATT };
 static ConnectionMode g_connMode = ConnectionMode::None;
 
 // Classic BT socket
+#ifndef DISABLE_CLASSIC_BT
 static SOCKET g_socket = INVALID_SOCKET;
+#endif
 
 // BLE GATT state
 static BluetoothLEDevice g_bleDevice{nullptr};
@@ -155,16 +172,23 @@ const int COMMAND_COUNT = sizeof(COMMANDS) / sizeof(COMMANDS[0]);
 // ============================================================
 // Unified device info
 // ============================================================
-enum class DeviceType { Classic, BLE, Watcher };
+enum class DeviceType {
+#ifndef DISABLE_CLASSIC_BT
+    Classic,
+#endif
+    BLE, Watcher
+};
 
 struct DiscoveredDevice {
     std::wstring name;
     uint64_t address = 0;
-    DeviceType type = DeviceType::Classic;
+    DeviceType type = DeviceType::BLE;
     bool paired = false;
     bool connected = false;
     int rssi = 0;
+#ifndef DISABLE_CLASSIC_BT
     bool isClassicSPP = false;
+#endif
     hstring deviceId;  // WinRT device ID for BLE pairing
 };
 
@@ -191,7 +215,9 @@ static std::string FormatMACAddress(uint64_t addr) {
 
 static const char* DeviceTypeToString(DeviceType t) {
     switch (t) {
+#ifndef DISABLE_CLASSIC_BT
         case DeviceType::Classic: return "Classic";
+#endif
         case DeviceType::BLE:     return "BLE";
         case DeviceType::Watcher: return "Watcher";
         default:                  return "Unknown";
@@ -201,6 +227,7 @@ static const char* DeviceTypeToString(DeviceType t) {
 // ============================================================
 // Classic Bluetooth discovery
 // ============================================================
+#ifndef DISABLE_CLASSIC_BT
 std::vector<DiscoveredDevice> DiscoverClassicBluetoothDevices() {
     std::vector<DiscoveredDevice> devices;
 
@@ -247,6 +274,7 @@ std::vector<DiscoveredDevice> DiscoverClassicBluetoothDevices() {
     printf("[DEBUG] Classic BT: Scan complete, found %zu device(s).\n", devices.size());
     return devices;
 }
+#endif // DISABLE_CLASSIC_BT
 
 // ============================================================
 // BLE scanner
@@ -500,9 +528,12 @@ void PrintDevices(const std::vector<DiscoveredDevice>& devices) {
 // ============================================================
 DiscoveredDevice* SelectDevice(std::vector<DiscoveredDevice>& devices) {
     for (auto& dev : devices) {
-        if (dev.name.find(DEVICE_PREFIX) != std::wstring::npos ||
+        if (
+#ifndef DISABLE_CLASSIC_BT
+            dev.name.find(DEVICE_PREFIX) != std::wstring::npos ||
             dev.name.find(DEVICE_PREFIX_ALT) != std::wstring::npos ||
             dev.name.find(DEVICE_PREFIX_PET) != std::wstring::npos ||
+#endif
             dev.name.find(DEVICE_PREFIX_BLE) != std::wstring::npos) {
             printf("\n[INFO] Auto-detected target device: %s\n", WToNarrow(dev.name).c_str());
             std::cout << "[INFO] Press Enter to use this device, or type a number to select another: ";
@@ -525,6 +556,7 @@ DiscoveredDevice* SelectDevice(std::vector<DiscoveredDevice>& devices) {
 // ============================================================
 // Classic BT pairing & connection
 // ============================================================
+#ifndef DISABLE_CLASSIC_BT
 bool PairWithDevice(uint64_t address, const wchar_t* passkey = L"1234") {
     BLUETOOTH_DEVICE_INFO deviceInfo = {};
     deviceInfo.dwSize = sizeof(deviceInfo);
@@ -575,6 +607,7 @@ bool ConnectClassicSPP(uint64_t address) {
     }
     return true;
 }
+#endif // DISABLE_CLASSIC_BT
 
 // ============================================================
 // BLE GATT connection via Nordic UART Service (NUS)
@@ -806,6 +839,7 @@ bool SendCommand(uint8_t cmd) {
         return false;
     }
 
+#ifndef DISABLE_CLASSIC_BT
     if (g_connMode == ConnectionMode::ClassicSPP) {
         if (g_socket == INVALID_SOCKET) {
             std::cerr << "[ERROR] Socket is invalid." << std::endl;
@@ -821,7 +855,9 @@ bool SendCommand(uint8_t cmd) {
             }
             return false;
         }
-    } else if (g_connMode == ConnectionMode::BLEGATT) {
+    } else
+#endif
+    if (g_connMode == ConnectionMode::BLEGATT) {
         if (!g_rxCharacteristic) {
             std::cerr << "[ERROR] BLE RX characteristic not available." << std::endl;
             return false;
@@ -850,11 +886,13 @@ bool SendCommand(uint8_t cmd) {
 // Disconnect
 // ============================================================
 void Disconnect() {
+#ifndef DISABLE_CLASSIC_BT
     if (g_connMode == ConnectionMode::ClassicSPP && g_socket != INVALID_SOCKET) {
         shutdown(g_socket, SD_BOTH);
         closesocket(g_socket);
         g_socket = INVALID_SOCKET;
     }
+#endif
     if (g_connMode == ConnectionMode::BLEGATT) {
         try {
             if (g_txCharacteristic) {
@@ -878,6 +916,7 @@ void Disconnect() {
 // ============================================================
 // Classic BT receive thread
 // ============================================================
+#ifndef DISABLE_CLASSIC_BT
 void ReceiveThreadClassic() {
     char buffer[256];
     fd_set readSet;
@@ -907,6 +946,7 @@ void ReceiveThreadClassic() {
         }
     }
 }
+#endif // DISABLE_CLASSIC_BT
 
 // ============================================================
 // Command parsing
@@ -931,9 +971,14 @@ int FindCommandByName(const std::string& name) {
 // ============================================================
 void InteractiveMode() {
     std::cout << "\n[INFO] Entering interactive mode. Type 'help' for commands." << std::endl;
-    std::cout << "[INFO] Connection mode: " <<
-        (g_connMode == ConnectionMode::ClassicSPP ? "Classic SPP" :
-         g_connMode == ConnectionMode::BLEGATT ? "BLE GATT (NUS)" : "None") << std::endl;
+    {
+        const char* modeStr = "None";
+        if (g_connMode == ConnectionMode::BLEGATT) modeStr = "BLE GATT";
+#ifndef DISABLE_CLASSIC_BT
+        else if (g_connMode == ConnectionMode::ClassicSPP) modeStr = "Classic SPP";
+#endif
+        printf("[INFO] Connection mode: %s\n", modeStr);
+    }
     std::cout << "> " << std::flush;
 
     std::string input;
@@ -967,11 +1012,19 @@ void InteractiveMode() {
             std::cout << std::endl;
         } else if (input == "status") {
             std::cout << "\nConnection Status:" << std::endl;
-            std::cout << "  Mode: " << (g_connMode == ConnectionMode::ClassicSPP ? "Classic SPP" :
-                                          g_connMode == ConnectionMode::BLEGATT ? "BLE GATT (NUS)" : "None") << std::endl;
+            {
+                const char* modeStr = "None";
+                if (g_connMode == ConnectionMode::BLEGATT) modeStr = "BLE GATT";
+#ifndef DISABLE_CLASSIC_BT
+                else if (g_connMode == ConnectionMode::ClassicSPP) modeStr = "Classic SPP";
+#endif
+                printf("  Mode: %s\n", modeStr);
+            }
             std::cout << "  Connected: " << (g_connected ? "Yes" : "No") << std::endl;
+#ifndef DISABLE_CLASSIC_BT
             if (g_connMode == ConnectionMode::ClassicSPP)
                 std::cout << "  Socket: " << (g_socket != INVALID_SOCKET ? "Valid" : "Invalid") << std::endl;
+#endif
             if (g_connMode == ConnectionMode::BLEGATT) {
                 std::cout << "  BLE RX Char: " << (g_rxCharacteristic ? "Available" : "Missing") << std::endl;
                 std::cout << "  BLE TX Char: " << (g_txCharacteristic ? "Available" : "Missing") << std::endl;
@@ -1006,8 +1059,7 @@ void InteractiveMode() {
 void PrintBanner() {
     std::cout << "========================================" << std::endl;
     std::cout << "  Desktop Pet Bluetooth Controller" << std::endl;
-    std::cout << "  Target: HC-05/HC-06 (Classic SPP)" << std::endl;
-    std::cout << "           ECB01H2S (BLE NUS)" << std::endl;
+    std::cout << "  Target: ECB01H2S BLE (GATT)" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << std::endl;
 }
@@ -1062,6 +1114,7 @@ fire_and_forget PairBLEDevice(uint64_t address, bool alreadyPaired) {
 int main() {
     PrintBanner();
 
+#ifndef DISABLE_CLASSIC_BT
     WSADATA wsaData;
     int wsResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
     if (wsResult != 0) {
@@ -1069,6 +1122,7 @@ int main() {
         return 1;
     }
     std::cout << "[DEBUG] Winsock initialized." << std::endl;
+#endif
 
     bool winrtOk = false;
     try {
@@ -1082,32 +1136,38 @@ int main() {
         std::cerr << "[ERROR] WinRT init unknown exception." << std::endl;
     }
 
+    if (!winrtOk) {
+        std::cerr << "[ERROR] WinRT initialization failed. BLE requires WinRT. Exiting." << std::endl;
+        return 1;
+    }
+
+#ifndef DISABLE_CLASSIC_BT
     // === Phase 1: Classic Bluetooth scan ===
     std::cout << "\n[INFO] === Phase 1: Classic Bluetooth scan ===" << std::endl;
     auto classicDevices = DiscoverClassicBluetoothDevices();
     printf("[INFO] Phase 1 complete: %zu Classic BT device(s).\n", classicDevices.size());
+#endif
 
-    // === Phase 2: BLE advertisement scan ===
+    // === BLE advertisement scan (5 seconds) ===
     std::vector<DiscoveredDevice> bleDevices;
-    if (winrtOk) {
-        std::cout << "\n[INFO] === Phase 2: BLE advertisement scan (10 seconds) ===" << std::endl;
-        BLEScanner bleScanner;
-        bleScanner.Start(10);
-        if (bleScanner.scanning) {
-            for (int i = 0; i < 10; i++) {
-                Sleep(1000);
-                printf("[DEBUG] BLE scanning... %d/10 seconds, found %d device(s)\n", i + 1, (int)bleScanner.deviceCount);
-            }
-            bleScanner.Stop();
+    std::cout << "\n[INFO] === BLE advertisement scan (5 seconds) ===" << std::endl;
+    BLEScanner bleScanner;
+    bleScanner.Start(5);
+    if (bleScanner.scanning) {
+        for (int i = 0; i < 5; i++) {
+            Sleep(1000);
+            printf("[DEBUG] BLE scanning... %d/5 seconds, found %d device(s)\n", i + 1, (int)bleScanner.deviceCount);
         }
-        bleDevices = bleScanner.GetDevices();
-        printf("[INFO] Phase 2 complete: %zu BLE device(s).\n", bleDevices.size());
+        bleScanner.Stop();
     }
+    bleDevices = bleScanner.GetDevices();
+    printf("[INFO] BLE scan complete: %zu device(s).\n", bleDevices.size());
 
-    // === Phase 3: WinRT DeviceWatcher ===
+#ifndef DISABLE_CLASSIC_BT
+    // === WinRT DeviceWatcher ===
     std::vector<DiscoveredDevice> watcherDevices;
-    if (winrtOk) {
-        std::cout << "\n[INFO] === Phase 3: WinRT DeviceWatcher scan ===" << std::endl;
+    {
+        std::cout << "\n[INFO] === WinRT DeviceWatcher scan ===" << std::endl;
         AllDeviceScanner allScanner;
         allScanner.Start(12);
         if (allScanner.started) {
@@ -1122,13 +1182,14 @@ int main() {
             allScanner.Stop();
         }
         watcherDevices = allScanner.GetDevices();
-        printf("[INFO] Phase 3 complete: %zu device(s) via DeviceWatcher.\n", watcherDevices.size());
+        printf("[INFO] Watcher complete: %zu device(s).\n", watcherDevices.size());
     }
+#endif
 
-    // === Merge all discovered devices ===
-    std::cout << "\n[INFO] === Merging scan results ===" << std::endl;
+    // === Merge discovered devices ===
     std::map<uint64_t, DiscoveredDevice> merged;
 
+#ifndef DISABLE_CLASSIC_BT
     for (auto& dev : classicDevices) {
         if (dev.address != 0) {
             printf("[DEBUG] Merge: Classic -> %s MAC=%s\n",
@@ -1150,13 +1211,12 @@ int main() {
             merged[dev.address] = dev;
         }
     }
+#endif
     for (auto& dev : bleDevices) {
         auto it = merged.find(dev.address);
         if (it != merged.end()) {
             if (dev.rssi != 0 && it->second.rssi == 0) it->second.rssi = dev.rssi;
             if (!dev.name.empty() && it->second.name.empty()) it->second.name = dev.name;
-            // Mark as BLE type if not already Classic
-            if (it->second.type == DeviceType::Watcher) it->second.type = DeviceType::BLE;
         } else {
             merged[dev.address] = dev;
         }
@@ -1166,16 +1226,16 @@ int main() {
     for (auto& kv : merged) allDevices.push_back(kv.second);
 
     if (allDevices.empty()) {
-        std::cerr << "\n[ERROR] No Bluetooth devices found!" << std::endl;
-        std::cerr << "[TIP] Make sure Bluetooth is enabled and devices are discoverable." << std::endl;
-        std::cerr << "[TIP] On Windows 11: Settings > Bluetooth & devices > Devices > Device settings > Advanced" << std::endl;
+        std::cerr << "\n[ERROR] No BLE devices found!" << std::endl;
+        std::cerr << "[TIP] Make sure Bluetooth is enabled and devices are in range." << std::endl;
         if (winrtOk) winrt::uninit_apartment();
+#ifndef DISABLE_CLASSIC_BT
         WSACleanup();
+#endif
         return 1;
     }
 
-    printf("\n[INFO] Total devices: %zu (Classic=%zu, BLE=%zu, Watcher=%zu)\n",
-           allDevices.size(), classicDevices.size(), bleDevices.size(), watcherDevices.size());
+    printf("\n[INFO] Total devices: %zu\n", allDevices.size());
     PrintDevices(allDevices);
 
     // === Device selection ===
@@ -1183,86 +1243,60 @@ int main() {
     if (!selectedDevice) {
         std::cerr << "[ERROR] No device selected." << std::endl;
         if (winrtOk) winrt::uninit_apartment();
+#ifndef DISABLE_CLASSIC_BT
         WSACleanup();
+#endif
         return 1;
     }
 
     printf("\n[INFO] Selected device: %s (%s)\n",
            WToNarrow(selectedDevice->name).c_str(), DeviceTypeToString(selectedDevice->type));
 
-    // === Connect based on device type ===
-    if (selectedDevice->type == DeviceType::BLE || selectedDevice->type == DeviceType::Watcher) {
-        // BLE device - use GATT connection
-        printf("[INFO] This is a BLE device. Connecting via GATT (Nordic UART Service)...\n");
+    // === BLE GATT connection ===
+    printf("[INFO] Connecting via BLE GATT...\n");
 
-        // Check if already paired - BLE GATT on Windows requires pairing for most operations
-        g_pairComplete = false;
-        PairBLEDevice(selectedDevice->address, selectedDevice->paired);
-        // Wait for pairing to finish (up to 60 seconds - user may need to confirm on Windows)
-        {
-            std::unique_lock<std::mutex> lk(g_pairMutex);
-            g_pairCv.wait_for(lk, std::chrono::seconds(60), [] { return g_pairComplete; });
-        }
-        if (!g_pairComplete) {
-            printf("[WARN] Pairing timed out. Trying connection anyway...\n");
-        }
+    // Pair if needed
+    g_pairComplete = false;
+    PairBLEDevice(selectedDevice->address, selectedDevice->paired);
+    {
+        std::unique_lock<std::mutex> lk(g_pairMutex);
+        g_pairCv.wait_for(lk, std::chrono::seconds(60), [] { return g_pairComplete; });
+    }
+    if (!g_pairComplete) {
+        printf("[WARN] Pairing timed out. Trying connection anyway...\n");
+    }
 
-        // Connect via BLE GATT (async, need to wait for completion)
-        g_connectComplete = false;
-        ConnectBLEGatt(selectedDevice->address);
+    // Connect via BLE GATT (async, wait for completion)
+    g_connectComplete = false;
+    ConnectBLEGatt(selectedDevice->address);
 
-        // Wait for connection to complete
-        printf("[INFO] Waiting for BLE GATT connection to complete...\n");
-        {
-            std::unique_lock<std::mutex> lk(g_connectMutex);
-            g_connectCv.wait_for(lk, std::chrono::seconds(30), [] { return g_connectComplete; });
-        }
-        if (!g_connectComplete) {
-            printf("[WARN] BLE GATT connection timed out after 30 seconds.\n");
-        }
-    } else {
-        // Classic Bluetooth - use SPP connection
-        if (!selectedDevice->paired) {
-            std::cout << "[INFO] Device not paired. Attempting to pair (PIN: 1234)..." << std::endl;
-            PairWithDevice(selectedDevice->address, L"1234");
-        } else {
-            std::cout << "[INFO] Device is already paired." << std::endl;
-        }
-
-        std::cout << "\n[INFO] Connecting via Classic SPP..." << std::endl;
-        if (!ConnectClassicSPP(selectedDevice->address)) {
-            std::cerr << "[ERROR] Failed to connect to device." << std::endl;
-            if (winrtOk) winrt::uninit_apartment();
-            WSACleanup();
-            return 1;
-        }
-        g_connMode = ConnectionMode::ClassicSPP;
-        g_connected = true;
-        std::cout << "[INFO] Connected successfully!" << std::endl;
+    printf("[INFO] Waiting for BLE GATT connection to complete...\n");
+    {
+        std::unique_lock<std::mutex> lk(g_connectMutex);
+        g_connectCv.wait_for(lk, std::chrono::seconds(30), [] { return g_connectComplete; });
+    }
+    if (!g_connectComplete) {
+        printf("[WARN] BLE GATT connection timed out after 30 seconds.\n");
     }
 
     if (!g_connected) {
         std::cerr << "[ERROR] Connection failed." << std::endl;
         if (winrtOk) winrt::uninit_apartment();
+#ifndef DISABLE_CLASSIC_BT
         WSACleanup();
+#endif
         return 1;
     }
-
-    // Start receive thread for Classic SPP
-    std::thread recvThread;
-    if (g_connMode == ConnectionMode::ClassicSPP) {
-        recvThread = std::thread(ReceiveThreadClassic);
-    }
-    // BLE GATT uses ValueChanged callback, no thread needed
 
     InteractiveMode();
 
     g_running = false;
     g_connected = false;
     Disconnect();
-    if (recvThread.joinable()) recvThread.join();
     if (winrtOk) winrt::uninit_apartment();
+#ifndef DISABLE_CLASSIC_BT
     WSACleanup();
+#endif
     std::cout << "\n[INFO] Program terminated." << std::endl;
     return 0;
 }
