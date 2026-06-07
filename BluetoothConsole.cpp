@@ -17,9 +17,10 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #ifndef DISABLE_CLASSIC_BT
-#include <winsock2.h>
 #include <ws2bth.h>
 #include <bluetoothapis.h>
 #pragma warning(disable: 4995)
@@ -46,13 +47,16 @@
 #include <algorithm>
 #include <map>
 #include <cstdio>
+#include <chrono>
 #include <condition_variable>
 
+#include "HttpCommand.h"
+
+#pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "runtimeobject.lib")
 #ifndef DISABLE_CLASSIC_BT
-#pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "bthprops.lib")
 #endif
 
@@ -89,6 +93,9 @@ const wchar_t* DEVICE_PREFIX_BLE  = L"guaguale";   // ECB01H2S module name prefi
 // Global state
 std::atomic<bool> g_running(true);
 std::atomic<bool> g_connected(false);
+static std::atomic<bool> g_httpRunning(false);
+static std::thread g_httpThread;
+static std::mutex g_sendMutex;
 
 // Connection mode
 enum class ConnectionMode { None
@@ -882,6 +889,247 @@ bool SendCommand(uint8_t cmd) {
     return true;
 }
 
+int FindCommandByName(const std::string& name);
+
+// ============================================================
+// Local HTTP control server for Claude Code hooks
+// ============================================================
+static bool SendAll(SOCKET client, const std::string& data) {
+    size_t sentTotal = 0;
+    while (sentTotal < data.size()) {
+        int sent = send(client, data.data() + sentTotal, (int)(data.size() - sentTotal), 0);
+        if (sent == SOCKET_ERROR || sent == 0) return false;
+        sentTotal += (size_t)sent;
+    }
+    return true;
+}
+
+static bool ReceiveUntil(SOCKET client, std::string& data, const std::string& marker, int maxBytes) {
+    char buffer[1024];
+    while ((int)data.size() < maxBytes && data.find(marker) == std::string::npos) {
+        int received = recv(client, buffer, sizeof(buffer), 0);
+        if (received <= 0) return false;
+        data.append(buffer, received);
+    }
+    return data.find(marker) != std::string::npos;
+}
+
+static bool ReceiveBody(SOCKET client, std::string& data, size_t bodyStart, int contentLength, int maxBytes) {
+    if (contentLength < 0 || contentLength > maxBytes) return false;
+    while (data.size() - bodyStart < (size_t)contentLength) {
+        char buffer[1024];
+        int received = recv(client, buffer, sizeof(buffer), 0);
+        if (received <= 0) return false;
+        data.append(buffer, received);
+        if ((int)data.size() > maxBytes) return false;
+    }
+    return true;
+}
+
+static std::string OneLineForLog(std::string value) {
+    for (char& ch : value) {
+        if (ch == '\r' || ch == '\n' || ch == '\t') ch = ' ';
+    }
+    return value;
+}
+
+static std::string CommandModeJson() {
+    const char* modeStr = "none";
+    if (g_connMode == ConnectionMode::BLEGATT) modeStr = "ble_gatt";
+#ifndef DISABLE_CLASSIC_BT
+    else if (g_connMode == ConnectionMode::ClassicSPP) modeStr = "classic_spp";
+#endif
+    return modeStr;
+}
+
+static HttpResponse HandleHttpCommandRequest(const HttpRequestHead& request, const std::string& body) {
+    if (request.path == "/health") {
+        std::string json = std::string("{\"ok\":true,\"connected\":") +
+            (g_connected ? "true" : "false") +
+            ",\"mode\":\"" + CommandModeJson() + "\"}";
+        return JsonResponse(200, "OK", json);
+    }
+
+    if (request.path != "/api/command") {
+        return JsonResponse(404, "Not Found", "{\"ok\":false,\"error\":\"not_found\"}");
+    }
+
+    if (request.method != "POST") {
+        return JsonResponse(405, "Method Not Allowed", "{\"ok\":false,\"error\":\"method_not_allowed\"}");
+    }
+
+    CommandPayload payload;
+    std::string error;
+    if (!ParseCommandPayload(body, payload, &error)) {
+        return JsonResponse(400, "Bad Request",
+            "{\"ok\":false,\"error\":\"" + EscapeJsonString(error) + "\"}");
+    }
+
+    uint8_t cmd = 0xFF;
+    std::string commandName;
+    if (payload.hasName) {
+        int index = FindCommandByName(payload.name);
+        if (index < 0) {
+            return JsonResponse(400, "Bad Request",
+                "{\"ok\":false,\"error\":\"unknown_command\",\"name\":\"" + EscapeJsonString(payload.name) + "\"}");
+        }
+        cmd = COMMANDS[index].code;
+        commandName = COMMANDS[index].name;
+    } else if (payload.hasCode && payload.code >= 0x00 && payload.code <= 0xFF) {
+        cmd = (uint8_t)payload.code;
+        int index = -1;
+        for (int i = 0; i < COMMAND_COUNT; i++) {
+            if (COMMANDS[i].code == cmd) { index = i; break; }
+        }
+        if (index >= 0) commandName = COMMANDS[index].name;
+    } else {
+        return JsonResponse(400, "Bad Request", "{\"ok\":false,\"error\":\"invalid_code\"}");
+    }
+
+    if (!g_connected) {
+        return JsonResponse(409, "Conflict", "{\"ok\":false,\"error\":\"not_connected\"}");
+    }
+
+    bool sent = false;
+    {
+        std::lock_guard<std::mutex> lock(g_sendMutex);
+        sent = SendCommand(cmd);
+    }
+    if (!sent) {
+        return JsonResponse(500, "Internal Server Error", "{\"ok\":false,\"error\":\"send_failed\"}");
+    }
+
+    char codeJson[16];
+    sprintf_s(codeJson, sizeof(codeJson), "%u", (unsigned int)cmd);
+    std::string json = "{\"ok\":true,\"code\":" + std::string(codeJson);
+    if (!commandName.empty()) json += ",\"name\":\"" + EscapeJsonString(commandName) + "\"";
+    json += "}";
+    return JsonResponse(200, "OK", json);
+}
+
+static void HandleHttpClient(SOCKET client) {
+    const int maxRequestBytes = 65536;
+    std::string raw;
+    HttpResponse response;
+
+    if (!ReceiveUntil(client, raw, "\r\n\r\n", maxRequestBytes)) {
+        response = JsonResponse(400, "Bad Request", "{\"ok\":false,\"error\":\"invalid_http_head\"}");
+        SendAll(client, BuildHttpResponse(response));
+        return;
+    }
+
+    size_t headEnd = raw.find("\r\n\r\n");
+    size_t bodyStart = headEnd + 4;
+    HttpRequestHead request;
+    std::string error;
+    if (!ParseHttpRequestHead(raw.substr(0, bodyStart), request, &error)) {
+        response = JsonResponse(400, "Bad Request",
+            "{\"ok\":false,\"error\":\"" + EscapeJsonString(error) + "\"}");
+        SendAll(client, BuildHttpResponse(response));
+        return;
+    }
+
+    if (request.expect100Continue) {
+        SendAll(client, "HTTP/1.1 100 Continue\r\n\r\n");
+    }
+
+    if (!ReceiveBody(client, raw, bodyStart, request.contentLength, maxRequestBytes)) {
+        response = JsonResponse(400, "Bad Request", "{\"ok\":false,\"error\":\"invalid_body\"}");
+        SendAll(client, BuildHttpResponse(response));
+        return;
+    }
+
+    std::string body = raw.substr(bodyStart, (size_t)request.contentLength);
+    response = HandleHttpCommandRequest(request, body);
+    printf("[INFO] HTTP: %s %s body=%s -> %d %s\n",
+           request.method.c_str(), request.path.c_str(),
+           OneLineForLog(body).c_str(), response.status, response.reason.c_str());
+    fflush(stdout);
+    SendAll(client, BuildHttpResponse(response));
+}
+
+static void HttpServerThread() {
+    SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSocket == INVALID_SOCKET) {
+        printf("[ERROR] HTTP: socket failed: %d\n", WSAGetLastError());
+        g_httpRunning = false;
+        return;
+    }
+
+    BOOL reuseAddr = TRUE;
+    setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuseAddr, sizeof(reuseAddr));
+
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(5679);
+
+    if (bind(listenSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        printf("[ERROR] HTTP: bind 127.0.0.1:5679 failed: %d\n", WSAGetLastError());
+        closesocket(listenSocket);
+        g_httpRunning = false;
+        return;
+    }
+
+    if (listen(listenSocket, SOMAXCONN) == SOCKET_ERROR) {
+        printf("[ERROR] HTTP: listen failed: %d\n", WSAGetLastError());
+        closesocket(listenSocket);
+        g_httpRunning = false;
+        return;
+    }
+
+    printf("[INFO] HTTP: Listening on http://127.0.0.1:5679\n");
+    while (g_httpRunning) {
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(listenSocket, &readSet);
+        timeval timeout = {};
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 200000;
+        int ready = select(0, &readSet, nullptr, nullptr, &timeout);
+        if (!g_httpRunning) break;
+        if (ready == SOCKET_ERROR) {
+            printf("[ERROR] HTTP: select failed: %d\n", WSAGetLastError());
+            break;
+        }
+        if (ready == 0) continue;
+
+        SOCKET client = accept(listenSocket, nullptr, nullptr);
+        if (client == INVALID_SOCKET) {
+            if (g_httpRunning) printf("[WARN] HTTP: accept failed: %d\n", WSAGetLastError());
+            continue;
+        }
+        HandleHttpClient(client);
+        shutdown(client, SD_BOTH);
+        closesocket(client);
+    }
+
+    closesocket(listenSocket);
+    printf("[INFO] HTTP: Server stopped.\n");
+}
+
+static void StartHttpServer() {
+    g_httpRunning = true;
+    g_httpThread = std::thread(HttpServerThread);
+}
+
+static void StopHttpServer() {
+    g_httpRunning = false;
+    if (g_httpThread.joinable()) g_httpThread.join();
+}
+
+struct HttpServerGuard {
+    ~HttpServerGuard() {
+        StopHttpServer();
+    }
+};
+
+struct WinsockGuard {
+    ~WinsockGuard() {
+        WSACleanup();
+    }
+};
+
 // ============================================================
 // Disconnect
 // ============================================================
@@ -1111,10 +1359,17 @@ fire_and_forget PairBLEDevice(uint64_t address, bool alreadyPaired) {
 // ============================================================
 // Main
 // ============================================================
-int main() {
+int main(int argc, char* argv[]) {
     PrintBanner();
 
-#ifndef DISABLE_CLASSIC_BT
+    int httpOnlySeconds = 0;
+    for (int i = 1; i < argc; i++) {
+        if (_stricmp(argv[i], "--http-only-seconds") == 0 && i + 1 < argc) {
+            httpOnlySeconds = atoi(argv[++i]);
+            if (httpOnlySeconds < 1) httpOnlySeconds = 1;
+        }
+    }
+
     WSADATA wsaData;
     int wsResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
     if (wsResult != 0) {
@@ -1122,7 +1377,19 @@ int main() {
         return 1;
     }
     std::cout << "[DEBUG] Winsock initialized." << std::endl;
-#endif
+    WinsockGuard winsockGuard;
+
+    StartHttpServer();
+    HttpServerGuard httpGuard;
+
+    if (httpOnlySeconds > 0) {
+        printf("[INFO] HTTP-only diagnostic mode for %d seconds.\n", httpOnlySeconds);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(httpOnlySeconds);
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        return 0;
+    }
 
     bool winrtOk = false;
     try {
@@ -1229,9 +1496,6 @@ int main() {
         std::cerr << "\n[ERROR] No BLE devices found!" << std::endl;
         std::cerr << "[TIP] Make sure Bluetooth is enabled and devices are in range." << std::endl;
         if (winrtOk) winrt::uninit_apartment();
-#ifndef DISABLE_CLASSIC_BT
-        WSACleanup();
-#endif
         return 1;
     }
 
@@ -1243,9 +1507,6 @@ int main() {
     if (!selectedDevice) {
         std::cerr << "[ERROR] No device selected." << std::endl;
         if (winrtOk) winrt::uninit_apartment();
-#ifndef DISABLE_CLASSIC_BT
-        WSACleanup();
-#endif
         return 1;
     }
 
@@ -1282,9 +1543,6 @@ int main() {
     if (!g_connected) {
         std::cerr << "[ERROR] Connection failed." << std::endl;
         if (winrtOk) winrt::uninit_apartment();
-#ifndef DISABLE_CLASSIC_BT
-        WSACleanup();
-#endif
         return 1;
     }
 
@@ -1294,9 +1552,6 @@ int main() {
     g_connected = false;
     Disconnect();
     if (winrtOk) winrt::uninit_apartment();
-#ifndef DISABLE_CLASSIC_BT
-    WSACleanup();
-#endif
     std::cout << "\n[INFO] Program terminated." << std::endl;
     return 0;
 }
